@@ -238,7 +238,7 @@ class VQADataset(torch.utils.data.Dataset):
             image_path = os.path.join(pth, "{}.jpg".format(item["image"]))
             img = cv2.imread(image_path)
             images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            ori_size = images.shape[:2] # 除去了3 channel   640 427 
+            ori_size = images.shape[:2] # 除去了3 channel 
             images_clip = self.clip_image_processor.preprocess(images, return_tensors="pt")[
                 "pixel_values"
             ][0]  # preprocess images for clip

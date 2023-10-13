@@ -5,6 +5,7 @@ import sys
 import time
 from functools import partial
 
+# os.environ['CUDA_VISIBLE_DEVICES'] = '1,3,6,7'
 import deepspeed
 import numpy as np
 import torch
@@ -52,16 +53,16 @@ def parse_args(args):
     parser.add_argument("--sample_rates", default="1", type=str)
     parser.add_argument(
         "--sem_seg_data",
-        default="kvasir", # synapse
+        default="siim||rsna||kvasir", # synapse
         type=str,
     )
     parser.add_argument(
         "--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog", type=str
     )
-    parser.add_argument("--vqa_data", default="VQA_RAD", type=str) # ||PMC_VQA||SLAKE||Path_VQA
+    parser.add_argument("--vqa_data", default="VQA_RAD||PMC_VQA||Path_VQA", type=str) # ||PMC_VQA||SLAKE||Path_VQA
     # VQA_RAD bs1:ok 2:ofm
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
-    parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
+    parser.add_argument("--val_dataset", default="slake_val", type=str)
     parser.add_argument("--dataset_dir", default="./dataset/dataset", type=str)
     parser.add_argument("--log_base_dir", default="./runs", type=str)
     parser.add_argument("--exp_name", default="lisa", type=str)
@@ -90,7 +91,9 @@ def parse_args(args):
     parser.add_argument("--num_classes_per_sample", default=3, type=int)
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
+    # parser.add_argument("--eval_only", action="store_false", default=True)
     parser.add_argument("--eval_only", action="store_true", default=False)
+
     parser.add_argument("--vision_pretrained", default="/home/yangjinxia/mine/sam_vit_h_4b8939.pth", type=str)
     parser.add_argument("--weight", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -157,12 +160,12 @@ def main(args):
         dataset=args.dataset,
         sample_rate=[float(x) for x in args.sample_rates.split(",")],
         sem_seg_data=args.sem_seg_data,
-        refer_seg_data=args.refer_seg_data,
-        vqa_data=args.vqa_data,
-        reason_seg_data=args.reason_seg_data,
+        # refer_seg_data=args.refer_seg_data,
+        # vqa_data=args.vqa_data,
+        # reason_seg_data=args.reason_seg_data,
         explanatory=args.explanatory,
     )
-
+    # 这里仍然会运行，所以同时存储了train和val的数据量，爆内存
     if args.no_eval == False:
         val_dataset = ValDataset(
             args.dataset_dir,
@@ -256,6 +259,7 @@ def main(args):
             train_iter,
             args,
         )
+
 
         if args.no_eval == False:
             giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
@@ -423,14 +427,17 @@ def validate(val_loader, model_engine, epoch, writer, args):
         output_dict = model_engine(**input_dict)
 
         pred_masks = output_dict["pred_masks"]
-        masks_list = output_dict["gt_masks"][0].int()
+        # print(len(pred_masks))
+        # print(pred_masks[0].shape)
+        masks_list = output_dict["gt_masks"][0].int() # 1 320 320
         output_list = (pred_masks[0] > 0).int()
+        # print(output_list.shape)
         assert len(pred_masks) == 1
 
         intersection, union, acc_iou = 0.0, 0.0, 0.0
         for mask_i, output_i in zip(masks_list, output_list):
             intersection_i, union_i, _ = intersectionAndUnionGPU(
-                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
+                output_i.contiguous().clone(), mask_i.contiguous(), 251, ignore_index=255
             )
             intersection += intersection_i
             union += union_i

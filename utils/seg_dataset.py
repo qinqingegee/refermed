@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 from pycocotools.coco import COCO
 from transformers import CLIPImageProcessor
+from einops import repeat
 
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
@@ -23,7 +24,7 @@ from .utils import (
     SHORT_QUESTION_LIST,
 )
 
-def init_synapse(base_image_dir):
+def init_synapse(base_image_dir): # 这数据集有点问题：原图不变，mask一直在变化
 
     synapse_data_root = os.path.join(base_image_dir, "segment/synapse")
     sample_list = open(os.path.join(synapse_data_root, 'train.txt')).readlines()
@@ -36,21 +37,49 @@ def init_synapse(base_image_dir):
     #             7: "aorta",
     #             8: "pancreas"}
 
-    classes = [" ", "spleen", "right kidney", "left kidney", "gallbladder", "liver", "stomach", "aorta", "pancreas"]
+    classes = [" ", "spleen", "right kidney", "left kidney", "gallbladder", "liver", "stomach", "aorta", "pancreas"] # 处理错了，第一个不应该是空，而是整体-1对到0索引
     return synapse_data_root, sample_list, classes
 
 def init_kvasir(base_image_dir):
-    synapse_data_root = os.path.join(base_image_dir, "segment/kvasir/Kvasir-SEG")
-    classes = ["polyp"]
+    data_root = os.path.join(base_image_dir, "segment/kvasir/Kvasir-SEG")
+    classes = ["", "polyp"]
 
     train_data = glob.glob(
-        os.path.join(synapse_data_root, "images", "*.jpg")
+        os.path.join(data_root, "images", "*.jpg")
     )
     mask_data = [
         x.replace("images", "masks")
         for x in train_data
     ]
-    return synapse_data_root, (train_data, mask_data), classes
+    return data_root, (train_data, mask_data), classes
+
+
+def init_siim(base_image_dir):
+    data_root = os.path.join(base_image_dir, "segment/siim")
+    classes = ["","pneumothorax"]
+
+    train_data = glob.glob(
+        os.path.join(data_root, "images", "*.jpg")
+    )
+    mask_data = [
+        x.replace("images", "masks")
+        for x in train_data
+    ]
+    return data_root, (train_data, mask_data), classes
+ 
+
+def init_rsna(base_image_dir):
+    data_root = os.path.join(base_image_dir, "segment/rsna")
+    classes = ["", "pneumonia"]
+
+    train_data = glob.glob(
+        os.path.join(data_root, "images", "*.jpg")
+    )
+    mask_data = [
+        x.replace("images", "masks")
+        for x in train_data
+    ]
+    return data_root, (train_data, mask_data), classes
  
 
  
@@ -70,7 +99,7 @@ class SemSegDataset(torch.utils.data.Dataset):
         image_size: int = 224,
         num_classes_per_sample: int = 3,
         exclude_val=False,
-        sem_seg_data="kvasir"#||",synapse  
+        sem_seg_data="synapse"  #||",synapse||siim||rsna||kvasir  
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
@@ -123,20 +152,27 @@ class SemSegDataset(torch.utils.data.Dataset):
             slice_name = self.data2list[ds][idx].strip('\n')
             image_path = os.path.join(self.data2path[ds],'train_npz', slice_name+'.npz')
             data = np.load(image_path)
-            images, label = data['image'], data['label']
+            images, label = data['image'], data['label']  # 2维 512*512 没有通道维度，repeat三次  image一直没变，label随着切片在变 whywhy
+            # images = torch.from_numpy(images).unsqueeze(2)  # 512*512*1
+            # images = np.expand_dims(images, axis=2) # 512*512*1
 
-            # preprocess images for clip 不知npz文件行不行
-            images_clip = self.clip_image_processor.preprocess(
-                images, return_tensors="pt"
-            )["pixel_values"][0]
+            images = torch.from_numpy(images).unsqueeze(2).numpy()
+            print(images[0])
+            images = repeat(images, 'h w c -> h w (repeat c)', repeat=3)  #.numpy()
+            
+            # preprocess images for clip 不知npz文件行不行 维度不对s
+            images_clip = self.clip_image_processor.preprocess(   # 检查图像是否合法, 故不通过; 直接用1维, normalize为3维,又不通过
+                images, return_tensors="pt", do_normalize= False
+            )["pixel_values"][0] # 按1维输进去，后面又repeat*3，还是有问题   
             image_token_len = (images_clip.shape[1] // 14) * (
                 images_clip.shape[2] // 14
             )  # FIXME: 14 is hardcoded patch size
 
-            images = self.transform.apply_image(images)  # preprocess images for sam
-            resize = images.shape[:2]
+            images = self.transform.apply_image(images)  # preprocess images for sam 512*512  就变了尺寸
+            resize = images.shape[:2]  # 512 512 
 
             unique_label = np.unique(label).tolist()
+            unique_label = [int(i) for i in unique_label]
 
             # 留不留
             # if 255 in unique_label:
@@ -152,34 +188,36 @@ class SemSegDataset(torch.utils.data.Dataset):
             else:
                 sampled_classes = classes
 
-        elif ds in ["kvasir"]:
+        elif ds in ["kvasir"]: #  no label的情况
             images, labels = self.data2list[ds]
             idx = random.randint(0, len(images) - 1)
             # data2classes
             image_path = images[idx]
             label_path = labels[idx]
-            img = cv2.imread(image_path)
-            images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.imread(image_path) #  530*619*3
+            images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # 530*619*3
+ 
+            label = cv2.imread(label_path)[:,:,0]/255
+            label = label.round().astype(int)
+            # label = np.round(label, 0)
 
-            label = Image.open(label_path) # mask
-            label = np.array(label)
             # preprocess images for clip 
             images_clip = self.clip_image_processor.preprocess(
                 images, return_tensors="pt"
-            )["pixel_values"][0]
+            )["pixel_values"][0]   # 3*224*224
             image_token_len = (images_clip.shape[1] // 14) * (
                 images_clip.shape[2] // 14
-            )  # FIXME: 14 is hardcoded patch size
+            )  # FIXME: 14 is hardcoded patch size 256
 
-            images = self.transform.apply_image(images)  # preprocess images for sam
-            resize = images.shape[:2]
+            images = self.transform.apply_image(images)  # preprocess images for sam 
+            resize = images.shape[:2]   # 
             unique_label = np.unique(label).tolist()
-            # 留不留
-            if 255 in unique_label:
-                unique_label.remove(255)
-            # if len(unique_label) == 0:
-            #     return self.__getitem__(0)
+            # 留不留  0 1的判断
+            if 0 in unique_label:
+                unique_label.remove(0)
 
+            if len(unique_label) == 0:
+                return self.__getitem__(0)
             classes = [self.data2classes[ds][class_id] for class_id in unique_label]
             if len(classes) >= self.num_classes_per_sample: # 如果包含了多个类，就随机选3个
                 sampled_classes = np.random.choice(
@@ -188,19 +226,58 @@ class SemSegDataset(torch.utils.data.Dataset):
             else:
                 sampled_classes = classes
 
+        elif ds in ["siim", "rsna"]:
+            images, labels = self.data2list[ds]
+            idx = random.randint(0, len(images) - 1)
+            # data2classes
+            image_path = images[idx]
+            label_path = labels[idx]
+            img = cv2.imread(image_path) #  530*619*3
+            images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # 530*619*3
+            label = Image.open(label_path)
+            label = np.array(label) / 255
+            label = label.round().astype(int) # binarize to 0 or 1 
+            
+            # preprocess images for clip 
+            images_clip = self.clip_image_processor.preprocess(
+                images, return_tensors="pt"
+            )["pixel_values"][0]   # 3*224*224
+            image_token_len = (images_clip.shape[1] // 14) * (
+                images_clip.shape[2] // 14
+            )  # FIXME: 14 is hardcoded patch size 256
+
+            images = self.transform.apply_image(images)  # 512 512 3
+            resize = images.shape[:2]   # [512,512]
+
+            unique_label = np.unique(label).tolist()
+            # 去除未编码的符号
+            if 0 in unique_label:
+                unique_label.remove(0)
+
+            # if len(unique_label) == 0:
+            #     return self.__getitem__(0)
+            classes = [self.data2classes[ds][class_id] for class_id in unique_label]
+            if len(classes) >= self.num_classes_per_sample: # 如果包含了多个类，就随机选3个
+                sampled_classes = np.random.choice(
+                    classes, size=self.num_classes_per_sample, replace=False
+                ).tolist()
+            else:
+                sampled_classes = classes
+                
+            
         questions = []
         answers = []
         class_ids = []
-        for sampled_cls in sampled_classes:
+        for sampled_cls in sampled_classes: # 随机选的类别
             text = sampled_cls
             assert len(text.split("||")) == 1
             question_template = random.choice(self.short_question_list) # 随机
             questions.append(question_template.format(class_name=text.lower()))
             answers.append(random.choice(self.answer_list))
-            if ds in ["paco_lvis", "pascal_part"]:
-                continue
+            # if ds in ["kvasir"]:
+            #     continue
             # 从文本映射为数字
-            class_id = self.classes.tolist().index(sampled_cls) # 找到在整个class列表中的id
+            class_id = self.data2classes[ds].index(sampled_cls) # 找到在整个class列表中的id
             class_ids.append(class_id)
 
         # 构造对话
@@ -224,21 +301,29 @@ class SemSegDataset(torch.utils.data.Dataset):
                 DEFAULT_IMAGE_TOKEN, replace_token
             )
         
+        
+        # if ds in ["synapse"]:
+        #     images = torch.from_numpy(images.astype(np.float32)).unsqueeze(2)
+        #     images = repeat(images, 'h w c -> h w (repeat c)', repeat=3).numpy()
         # （H, W, C）-> (C, H, W)
-        images = self.preprocess(torch.from_numpy(images).permute(2, 0, 1).contiguous())
-        label = torch.from_numpy(label).long()
+        images = self.preprocess(torch.from_numpy(images).permute(2, 0, 1).contiguous()) # 3*1024*1024
+        label = torch.from_numpy(label).long() # 1024 1024
+       
+        # if ds not in ["kvasir"]:
         masks = []
         for class_id in class_ids:
             masks.append(label == class_id)
-        masks = torch.stack(masks, dim=0)
+        masks = torch.stack(masks, dim=0) # 不同类别对应的mask stack在一起
+        # else:
+        #     masks = label
         return (
             image_path,
-            images,
-            images_clip,
+            images,   # 3*1024*1024
+            images_clip,  # 3*224*224
             conversations,
-            masks,
-            label,
-            resize,
+            masks,   # 1*1024*1024
+            label,   # 1024*1024
+            resize,  # 512 512
             questions,
             sampled_classes,
         )

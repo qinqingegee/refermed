@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from pycocotools import mask
 from transformers import CLIPImageProcessor
+from PIL import Image
 
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
@@ -244,6 +245,24 @@ class HybridDataset(torch.utils.data.Dataset):
         return *data[0], inference
 
 
+
+# 读取class，image和mask路径
+def init_slake_val(base_image_dir):
+    folders = glob.glob(os.path.join(base_image_dir,"Slake/Slake1.0/imgs/*"))
+    # print(folders)
+    image_data = [os.path.join(f, "source.jpg") for f in folders]
+    mask_data = [os.path.join(f, "mask.png") for f in folders]
+    # class
+    class_file = open(os.path.join(base_image_dir, "Slake/Slake1.0/mask.txt"))
+    content = class_file.read()
+    result = {}
+    for line in content.split('\n'):
+        key, value = line.split(':')
+        result[int(key)] = value
+    return (image_data, mask_data), result
+
+# print(init_slake_val("/home/yangjinxia/mine/dataset/")[2])
+
 class ValDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
     pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
@@ -259,59 +278,19 @@ class ValDataset(torch.utils.data.Dataset):
         image_size=1024,
     ):
         self.base_image_dir = base_image_dir
-        splits = val_dataset.split("|")
-        if len(splits) == 2:
-            ds, split = splits
-            images = glob.glob(
-                os.path.join(self.base_image_dir, "reason_seg", ds, split, "*.jpg")
-            )
-            self.images = images
-            self.data_type = "reason_seg"
-        elif len(splits) == 3:
-            ds, splitBy, split = splits
-            refer_api = REFER(self.base_image_dir, ds, splitBy)
-            ref_ids_val = refer_api.getRefIds(split=split)
-            images_ids_val = refer_api.getImgIds(ref_ids=ref_ids_val)
-            refs_val = refer_api.loadRefs(ref_ids=ref_ids_val)
-            refer_seg_ds = {}
-            refer_seg_ds["images"] = []
-            loaded_images = refer_api.loadImgs(image_ids=images_ids_val)
-            for item in loaded_images:
-                item = item.copy()
-                if ds == "refclef":
-                    item["file_name"] = os.path.join(
-                        base_image_dir, "images/saiapr_tc-12", item["file_name"]
-                    )
-                elif ds in ["refcoco", "refcoco+", "refcocog", "grefcoco"]:
-                    item["file_name"] = os.path.join(
-                        base_image_dir,
-                        "images/mscoco/images/train2014",
-                        item["file_name"],
-                    )
-                refer_seg_ds["images"].append(item)
-            refer_seg_ds["annotations"] = refer_api.Anns  # anns_val
-
-            img2refs = {}
-            for ref in refs_val:
-                image_id = ref["image_id"]
-                img2refs[image_id] = img2refs.get(image_id, []) + [
-                    ref,
-                ]
-            refer_seg_ds["img2refs"] = img2refs
-            self.refer_seg_ds = refer_seg_ds
-            self.data_type = "refer_seg"
-
-        self.ds = ds
+        # splits = val_dataset.split("|")  # ReasonSeg|va
+        # ds = val_dataset
+        self.ds = val_dataset
         self.image_size = image_size
         self.tokenizer = tokenizer
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        self.data2list, self.data2class = eval("init_{}".format(self.ds))(base_image_dir)
+
 
     def __len__(self):
-        if self.data_type == "refer_seg":
-            return len(self.refer_seg_ds["images"])
-        else:
-            return len(self.images)
+        
+        return len(self.data2list[0])
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
@@ -326,62 +305,47 @@ class ValDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        if self.data_type == "refer_seg":
-            refer_seg_ds = self.refer_seg_ds
-            images = refer_seg_ds["images"]
-            annotations = refer_seg_ds["annotations"]
-            img2refs = refer_seg_ds["img2refs"]
+        images, labels = self.data2list
+        idx = random.randint(0, len(images) - 1)
+        image_path = images[idx]
+        label_path = labels[idx]
+        label = Image.open(label_path)  # 1024*1024*3 此处有胸片  生成一下对应的mask图像？
+        label = np.array(label)[:, :, 0]
+        label[label == 0] = 255
+        # json 文件是字典
+        img = cv2.imread(image_path)
+        images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        images_clip = self.clip_image_processor.preprocess(images, return_tensors="pt")["pixel_values"][0]
+        images = self.transform.apply_image(images)
 
-            image = images[idx]
-            image_path = image["file_name"]
-            image_id = image["id"]
-
-            refs = img2refs[image_id]
-            if len(refs) == 0:
-                raise ValueError("image {} has no refs".format(image_id))
-
-            sents = []
-            ann_ids = []
-            for ref in refs:
-                for sent in ref["sentences"]:
-                    sents.append(sent["sent"].strip().lower())
-                    ann_ids.append(ref["ann_id"])
-
-            sampled_sents = sents
-            sampled_ann_ids = ann_ids
-            img = cv2.imread(image_path)
-            images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            is_sentence = False
-        else:
-            image_path = self.images[idx]
-            img = cv2.imread(image_path)
-            images = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            json_path = image_path.replace(".jpg", ".json")
-            mask_json, sampled_sents, is_sentence = get_mask_from_json(json_path, img)
-            sampled_sents = [sampled_sents[0]]
-
+        resize = images.shape[:2]
+        unique_label = np.unique(label).tolist()
+        if 255 in unique_label:
+            unique_label.remove(255)
+        if len(unique_label) == 0 or len(unique_label) > 250:
+            return self.__getitem__(0)  # 换张图
+       
+        sampled_classes_id = [i for i in unique_label if self.data2class.get(i) ]
+        if len(sampled_classes_id) > 1:
+            sampled_classes_id = np.random.choice(
+                sampled_classes_id, size=1, replace=False
+            ).tolist()
+        classes = [self.data2class[i] for i in sampled_classes_id]
+ 
         conversations = []
         conv = get_default_conv_template("vicuna").copy()
         i = 0
-        while i < len(sampled_sents):
+        while i < len(classes): # 文本很长
             conv.messages = []
-            text = sampled_sents[i].strip()
-            if is_sentence:
-                conv.append_message(
-                    conv.roles[0],
-                    DEFAULT_IMAGE_TOKEN
-                    + " {} Please output segmentation mask.".format(text),
-                )
-                conv.append_message(conv.roles[1], "[SEG].")
-            else:
-                conv.append_message(
-                    conv.roles[0],
-                    DEFAULT_IMAGE_TOKEN
-                    + " What is {} in this image? Please output segmentation mask.".format(
-                        text
-                    ),
-                )
-                conv.append_message(conv.roles[1], "[SEG].")
+            text = classes[i].strip()
+            conv.append_message(
+                conv.roles[0],
+                DEFAULT_IMAGE_TOKEN
+                + " What is {} in this image? Please output segmentation mask.".format(
+                    text
+                ),
+            )
+            conv.append_message(conv.roles[1], "[SEG].")
             conversations.append(conv.get_prompt())
             i += 1
 
@@ -395,50 +359,17 @@ class ValDataset(torch.utils.data.Dataset):
             conversations[i] = conversations[i].replace(
                 DEFAULT_IMAGE_TOKEN, replace_token
             )
-
-        # preprocess images for clip
-        images_clip = self.clip_image_processor.preprocess(images, return_tensors="pt")[
-            "pixel_values"
-        ][0]
-        image_token_len = (images_clip.shape[1] // 14) * (
-            images_clip.shape[2] // 14
-        )  # FIXME: 14 is hardcoded patch size
-
-        # preprocess images for sam
-        images = self.transform.apply_image(images)
-
-        resize = images.shape[:2]
-
-        images = self.preprocess(torch.from_numpy(images).permute(2, 0, 1).contiguous())
-
-        if self.data_type == "refer_seg":
-            masks = []
-            for i, ann_id in enumerate(sampled_ann_ids):
-                ann = annotations[ann_id]
-                if len(ann["segmentation"]) == 0 and sampled_sents[i] != "":
-                    m = np.zeros((image["height"], image["width"], 1))
-                else:
-                    if type(ann["segmentation"][0]) == list:  # polygon
-                        rle = mask.frPyObjects(
-                            ann["segmentation"], image["height"], image["width"]
-                        )
-                    else:
-                        rle = ann["segmentation"]
-                        for i in range(len(rle)):
-                            if not isinstance(rle[i]["counts"], bytes):
-                                rle[i]["counts"] = rle[i]["counts"].encode()
-                    m = mask.decode(rle)
-                m = np.sum(
-                    m, axis=2
-                )  # sometimes there are multiple binary map (corresponding to multiple segs)
-                m = m.astype(np.uint8)  # convert to np.uint8
-                masks.append(m)
-        else:
-            masks = [mask_json]
-
-        masks = np.stack(masks, axis=0)
-        masks = torch.from_numpy(masks)
-        labels = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
+        images = self.preprocess(torch.from_numpy(images).permute(2, 0, 1).contiguous()) # 前面只是把格式变了，还需后续处理
+        
+        label = torch.from_numpy(label)
+        masks = []
+        for class_id in sampled_classes_id:
+            masks.append(label==class_id)
+        masks = torch.stack(masks, dim=0) #1，1024，1024，3
+        
+        # masks = np.stack(masks, axis=0)
+        # masks = torch.from_numpy(masks)
+        labels = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label  ###### 
         inference = True
 
         return (

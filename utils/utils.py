@@ -9,6 +9,14 @@ DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
 
+REASON_QUESTION_LIST = [
+    DEFAULT_IMAGE_TOKEN + " " + "Identify and segment the area corresponding to the {text}",
+    DEFAULT_IMAGE_TOKEN + " " + "Segment and highlight {text}",
+    DEFAULT_IMAGE_TOKEN + " " + "Segment the regions with {text}",
+    DEFAULT_IMAGE_TOKEN + " " + "Please detect and segment the {text}"
+
+]
+
 SHORT_QUESTION_LIST = [
     DEFAULT_IMAGE_TOKEN + " " + "Can you segment the {class_name} in this image?",
     DEFAULT_IMAGE_TOKEN + " " + "Please segment the {class_name} in this image.",
@@ -118,6 +126,9 @@ class AverageMeter(object):
 def intersectionAndUnionGPU(output, target, K, ignore_index=255):
     # 'K' classes, output and target sizes are N or N * L or N * H * W, each value in range 0 to K - 1.
     assert output.dim() in [1, 2, 3]
+    # print("**********===================(((((((((*******)))))))))")
+    # print(output.shape)
+    # print(target.shape)
     assert output.shape == target.shape
     output = output.view(-1)
     target = target.view(-1)
